@@ -1,0 +1,98 @@
+# agentic-devbox · base blueprint for the `universal-agent` sidecar.
+#
+# Projects include this file instead of copying it (see project-template/docker-compose.yml):
+#
+#   include:
+#     - path: ${AGENTIC_DEVBOX_HOME:-${HOME}/.config/agentic-devbox}/base-compose.yml
+#       project_directory: .
+#
+# `project_directory: .` resolves every relative path below against the including
+# project, so this one blueprint serves any number of fully isolated projects.
+# Paths back into this folder use ${AGENTIC_DEVBOX_HOME}.
+#
+# Per-project knobs, read from the project's .env file:
+#   AGENTIC_DEVBOX_STATE_DIR  Host folder for tool logins, sessions and native configs.
+#                            Default ./.agentic-devbox/home is private to the project.
+#                            Set it to ${HOME}/.agentic-devbox to share one state on purpose.
+#   AGENTIC_DEVBOX_MEMORY     Memory limit for the sidecar (default 8g).
+#   AGENTIC_DEVBOX_VSCODE_WEB 1 starts VS Code in the browser on AGENTIC_DEVBOX_VSCODE_WEB_PORT
+#                            (default 8800; publish it on the app service). See docs/vscode.md.
+#   AGENTIC_DEVBOX_AGENTS     Build-time list of agent CLIs to install (default: all five).
+#   AGENT_UID / AGENT_GID    Build-time user ids so files in /workspace keep your ownership.
+#                            Only matter on Linux hosts whose uid is not 1000. The
+#                            `agentic-devbox` CLI exports them for you; with plain compose,
+#                            export them in your shell profile: export AGENT_UID=$(id -u) AGENT_GID=$(id -g)
+
+services:
+  universal-agent:
+    image: agentic-devbox:local
+    build:
+      context: ${AGENTIC_DEVBOX_HOME:-${HOME}/.config/agentic-devbox}
+      dockerfile: Dockerfile.agents
+      # Unset variables fall back to the defaults in Dockerfile.agents.
+      args:
+        - AGENT_UID
+        - AGENT_GID
+        - AGENTIC_DEVBOX_AGENTS
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+    # Later files win: host shell > project secrets > global secrets.
+    env_file:
+      - path: ${AGENTIC_DEVBOX_HOME:-${HOME}/.config/agentic-devbox}/secrets.env
+        required: false
+      - path: ./.agentic-devbox/secrets.env
+        required: false
+      - path: ${AGENTIC_DEVBOX_HOME:-${HOME}/.config/agentic-devbox}/env/passthrough.env
+
+    volumes:
+      # The project codebase.
+      - type: bind
+        source: ./
+        target: /workspace
+      # Tool state (logins, history, native settings). One bind mount; the host path decides isolation.
+      - type: bind
+        source: ${AGENTIC_DEVBOX_STATE_DIR:-./.agentic-devbox/home}
+        target: /home/agent/.agentic-devbox
+      # Declarative config layers, read-only so an agent cannot rewrite its own MCP servers or settings.
+      - type: bind
+        source: ./.agentic-devbox
+        target: /etc/agentic-devbox/project
+        read_only: true
+      - type: bind
+        source: ${AGENTIC_DEVBOX_HOME:-${HOME}/.config/agentic-devbox}/mcp-global.json
+        target: /etc/agentic-devbox/global/mcp-global.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${AGENTIC_DEVBOX_HOME:-${HOME}/.config/agentic-devbox}/settings-global.json
+        target: /etc/agentic-devbox/global/settings-global.json
+        read_only: true
+        bind:
+          create_host_path: false
+      # npm / uv / browser caches, private to this project and seeded from the image.
+      - agent-cache:/home/agent/.cache
+      # VS Code server and extensions (desktop Dev Containers and browser serve-web).
+      - vscode-server:/home/agent/.vscode-server
+
+    tmpfs:
+      # Rendered runtime files (browser profile, logs, status). Never written to disk.
+      - /run/agentic-devbox:mode=0700,uid=${AGENT_UID:-1000},gid=${AGENT_GID:-1000}
+      # Hide .agentic-devbox (credentials, state) from the agent's view of the workspace.
+      - /workspace/.agentic-devbox:ro,mode=0555
+
+    # Headless Chrome needs a large /dev/shm.
+    shm_size: 2gb
+    mem_limit: ${AGENTIC_DEVBOX_MEMORY:-8g}
+    pids_limit: 4096
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  agent-cache: {}
+  vscode-server: {}

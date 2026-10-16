@@ -1,0 +1,3 @@
+#!/bin/sh
+# Legacy `docker-compose` spelling inside the agent sidecar; see ./docker.
+exec "$(dirname "$0")/docker" compose "$@"

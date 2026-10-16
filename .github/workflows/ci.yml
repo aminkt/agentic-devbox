@@ -1,0 +1,67 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly: catch breaking changes in the `latest` agent CLIs early.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: shellcheck
+        run: shellcheck install.sh bin/agentic-devbox runtime/entrypoint.sh runtime/profile.d/agentic-devbox.sh runtime/bin/docker-compose tests/smoke.sh
+
+      - name: hadolint
+        run: docker run --rm -i -v "$PWD/.hadolint.yaml:/.config/hadolint.yaml:ro" hadolint/hadolint:v2.15.1 < Dockerfile.agents
+
+      - name: JSON files are valid
+        # devcontainer.json is JSON with comments (JSONC), which jq does not accept.
+        run: |
+          find . -name '*.json' -not -path '*/node_modules/*' -not -name devcontainer.json -print0 | xargs -0 -n1 jq empty
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: runtime unit tests
+        working-directory: runtime
+        run: npm ci && npm test
+
+      - name: compose model resolves
+        env:
+          AGENTIC_DEVBOX_HOME: ${{ github.workspace }}
+        run: |
+          touch secrets.env
+          docker compose -f project-template/docker-compose.yml config --quiet
+
+  smoke:
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      # Builds with the runner's uid (1001), exercising the Linux ownership mapping.
+      - name: build image
+        run: bin/agentic-devbox build
+
+      - name: smoke test
+        run: tests/smoke.sh

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/aminkt/agentic-devbox/main/schema/settings.schema.json",
+  "agents": {
+    "claude": {
+      "settings": {
+        "permissions": {
+          "allow": ["Bash(npm test *)", "Bash(devbox-browser *)", "mcp__postgres__*"]
+        }
+      }
+    }
+  }
+}

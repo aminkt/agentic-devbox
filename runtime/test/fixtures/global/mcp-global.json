@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem@1.0.0", "/workspace"]
+    },
+    "chrome-devtools": {
+      "command": "npx",
+      "args": ["-y", "chrome-devtools-mcp@1.11.0", "--browser-url=http://127.0.0.1:${AGENTIC_DEVBOX_CDP_PORT:-9222}"]
+    },
+    "fetch": {
+      "command": "uvx",
+      "args": ["mcp-server-fetch==2026.10.10"]
+    }
+  }
+}

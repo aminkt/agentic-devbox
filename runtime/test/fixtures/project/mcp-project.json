@@ -1,0 +1,41 @@
+{
+  "mcpServers": {
+    "fetch": {
+      "disabled": true
+    },
+    "postgres": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@bytebase/dbhub@1.5.0",
+        "--transport",
+        "stdio",
+        "--config",
+        "/etc/agentic-devbox/project/dbhub.toml"
+      ],
+      "env": {
+        "PROJECT_DB_URL": "${PROJECT_DB_URL}"
+      }
+    },
+    "issues": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${ISSUES_TOKEN}"
+      },
+      "agents": [
+        "claude",
+        "codex",
+        "opencode"
+      ]
+    },
+    "chrome-devtools": {
+      "agents": [
+        "copilot",
+        "agy",
+        "codex",
+        "opencode"
+      ]
+    }
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/aminkt/agentic-devbox/main/schema/mcp.schema.json",
+  "title": "agentic-devbox MCP layer (mcp-global.json / mcp-project.json)",
+  "description": "MCP servers in the standard mcpServers format. agentic-devbox translates them into each agent's native config. Strings may reference ${VAR} or ${VAR:-default}.",
+  "type": "object",
+  "properties": {
+    "$schema": { "type": "string" },
+    "mcpServers": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/server" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "stringMap": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "server": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "enum": ["stdio", "http", "sse"],
+          "description": "Defaults to \"stdio\" when command is set and \"http\" when url is set."
+        },
+        "command": { "type": "string", "description": "Executable for a stdio server, e.g. npx or uvx." },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "env": { "$ref": "#/$defs/stringMap", "description": "Environment for the server process." },
+        "url": { "type": "string", "description": "Endpoint of an http or sse server." },
+        "headers": { "$ref": "#/$defs/stringMap" },
+        "agents": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Only configure this server for these agent ids (claude, copilot, agy, codex, opencode)."
+        },
+        "tools": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Allowed tool names (honoured by Copilot and Codex). Omit or [\"*\"] for all."
+        },
+        "disabled": {
+          "type": "boolean",
+          "description": "In mcp-project.json: remove a server inherited from mcp-global.json. An entry without command or url modifies the global server of the same name instead of replacing it."
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

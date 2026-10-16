@@ -1,0 +1,19 @@
+{
+  "name": "agentic-devbox-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "description": "In-container runtime for agentic-devbox: config engine, tool adapters and browser helper.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "dependencies": {
+    "playwright-core": "1.64.1",
+    "puppeteer-core": "25.14.0",
+    "smol-toml": "1.9.1"
+  }
+}

@@ -1,0 +1,14 @@
+# Credentials: never commit.
+secrets.env
+.env
+.env.*
+!.env.example
+
+# Per-project agent state created when running the example in place.
+.agentic-devbox/home/
+project-template/.agentic-devbox/secrets.env
+
+# Dependencies and tooling
+node_modules/
+*.log
+.DS_Store

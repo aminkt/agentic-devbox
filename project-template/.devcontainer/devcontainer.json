@@ -1,0 +1,27 @@
+// Desktop VS Code inside the agent sidecar (Dev Containers extension).
+// Open this project in VS Code and run "Dev Containers: Reopen in Container".
+// The editor UI stays on your machine; the terminal, extensions and git run in the sidecar.
+{
+  "name": "agentic-devbox example",
+  "dockerComposeFile": ["../docker-compose.yml"],
+  "service": "universal-agent",
+  "workspaceFolder": "/workspace",
+
+  // The sidecar already runs as the unprivileged `agent` user with your uid, and its
+  // entrypoint starts the browser and applies agent config: keep both.
+  "remoteUser": "agent",
+  "updateRemoteUserUID": false,
+  "overrideCommand": false,
+
+  // Closing VS Code leaves the stack running; stop it with `agentic-devbox down`.
+  "shutdownAction": "none",
+
+  "customizations": {
+    "vscode": {
+      "extensions": ["anthropic.claude-code", "GitHub.copilot-chat", "openai.chatgpt"],
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  }
+}

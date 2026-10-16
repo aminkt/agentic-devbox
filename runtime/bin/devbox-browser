@@ -1,0 +1,141 @@
+#!/usr/bin/env node
+// devbox-browser: drive the sandbox's headless Chrome over the DevTools protocol.
+//
+//   devbox-browser status                         Browser version and open tabs
+//   devbox-browser open <url>                     Load a page; print status, title, final URL
+//   devbox-browser screenshot <url> [file.png]    Save a screenshot (default /tmp/devbox-browser/);
+//                                                  --full-page, --width, --height
+//   devbox-browser console <url>                  Console messages, page errors and failed
+//                                                  requests; exits 1 if any errors occurred
+//   devbox-browser run <script.mjs> [args...]     Run a script: export default async ({ browser, page, args, cdpUrl })
+//
+// Common options: --wait <ms> extra settle time (default 500), --timeout <ms> (default 30000).
+
+import fs from 'node:fs';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+import puppeteer from 'puppeteer-core';
+
+const cdpUrl = process.env.AGENTIC_DEVBOX_CDP_URL ?? `http://127.0.0.1:${process.env.AGENTIC_DEVBOX_CDP_PORT ?? '9222'}`;
+
+function parseArgs(argv) {
+  const flags = { wait: 500, timeout: 30000, width: 1280, height: 800, 'full-page': false };
+  const positional = [];
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    if (arg === '--full-page') flags['full-page'] = true;
+    else if (arg.startsWith('--') && arg.includes('=')) {
+      const [key, value] = arg.slice(2).split('=');
+      flags[key] = Number(value);
+    } else if (arg.startsWith('--') && arg.slice(2) in flags) flags[arg.slice(2)] = Number(argv[(i += 1)]);
+    else positional.push(arg);
+  }
+  return { flags, positional };
+}
+
+async function connect(flags) {
+  try {
+    return await puppeteer.connect({ browserURL: cdpUrl, defaultViewport: { width: flags.width, height: flags.height } });
+  } catch (err) {
+    console.error(`Cannot reach Chrome DevTools at ${cdpUrl}: ${err.message}`);
+    console.error('Check `agentic-devbox-config doctor` and /run/agentic-devbox/chrome.log.');
+    process.exit(3);
+  }
+}
+
+// Opens a fresh tab, runs fn, always closes the tab and detaches from the browser.
+async function withPage(flags, fn) {
+  const browser = await connect(flags);
+  const page = await browser.newPage();
+  page.setDefaultTimeout(flags.timeout);
+  try {
+    return await fn(page, browser);
+  } finally {
+    await page.close().catch(() => {});
+    await browser.disconnect();
+  }
+}
+
+async function load(page, url, flags) {
+  const response = await page.goto(url, { waitUntil: 'networkidle2', timeout: flags.timeout });
+  if (flags.wait) await new Promise((r) => setTimeout(r, flags.wait));
+  return response;
+}
+
+const commands = {
+  async status(_, flags) {
+    const res = await fetch(`${cdpUrl}/json/version`).catch(() => null);
+    if (!res?.ok) {
+      console.error(`Chrome DevTools not reachable at ${cdpUrl}`);
+      return 3;
+    }
+    const version = await res.json();
+    const tabs = await (await fetch(`${cdpUrl}/json/list`)).json();
+    console.log(`${version.Browser} (${version['Protocol-Version']}) at ${cdpUrl}`);
+    for (const tab of tabs.filter((t) => t.type === 'page')) console.log(`  tab ${tab.id.slice(0, 8)}  ${tab.url}`);
+    return 0;
+  },
+
+  async open([url], flags) {
+    if (!url) throw new Error('usage: devbox-browser open <url>');
+    return withPage(flags, async (page) => {
+      const response = await load(page, url, flags);
+      console.log(JSON.stringify({ status: response?.status() ?? null, title: await page.title(), url: page.url() }, null, 2));
+      return response && response.status() < 400 ? 0 : 1;
+    });
+  },
+
+  async screenshot([url, out], flags) {
+    if (!url) throw new Error('usage: devbox-browser screenshot <url> [file.png]');
+    const file = path.resolve(out ?? `/tmp/devbox-browser/screenshot-${Date.now()}.png`);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    return withPage(flags, async (page) => {
+      await load(page, url, flags);
+      await page.screenshot({ path: file, fullPage: flags['full-page'] });
+      console.log(file);
+      return 0;
+    });
+  },
+
+  async console([url], flags) {
+    if (!url) throw new Error('usage: devbox-browser console <url>');
+    return withPage(flags, async (page) => {
+      const events = [];
+      page.on('console', (msg) => events.push({ kind: `console.${msg.type()}`, text: msg.text() }));
+      page.on('pageerror', (err) => events.push({ kind: 'pageerror', text: err.message }));
+      page.on('requestfailed', (req) => events.push({ kind: 'requestfailed', text: `${req.failure()?.errorText} ${req.url()}` }));
+      page.on('response', (res) => {
+        if (res.status() >= 400) events.push({ kind: `http.${res.status()}`, text: res.url() });
+      });
+      await load(page, url, flags);
+      for (const e of events) console.log(`${e.kind.padEnd(18)} ${e.text}`);
+      const errors = events.filter((e) => /error|pageerror|requestfailed|http\.[45]/.test(e.kind));
+      console.log(`\n${events.length} event(s), ${errors.length} error(s)`);
+      return errors.length ? 1 : 0;
+    });
+  },
+
+  async run([script, ...args], flags) {
+    if (!script) throw new Error('usage: devbox-browser run <script.mjs> [args...]');
+    const mod = await import(pathToFileURL(path.resolve(script)).href);
+    if (typeof mod.default !== 'function') throw new Error(`${script} must export a default async function`);
+    return withPage(flags, async (page, browser) => {
+      const result = await mod.default({ browser, page, args, cdpUrl, puppeteer });
+      if (result !== undefined) console.log(typeof result === 'string' ? result : JSON.stringify(result, null, 2));
+      return 0;
+    });
+  },
+};
+
+const [command, ...rest] = process.argv.slice(2);
+if (!commands[command]) {
+  console.error('Usage: devbox-browser <status|open|screenshot|console|run> [args]  (see the header of this file)');
+  process.exit(2);
+}
+const { flags, positional } = parseArgs(rest);
+try {
+  process.exitCode = await commands[command](positional, flags);
+} catch (err) {
+  console.error(err.message);
+  process.exitCode = 1;
+}

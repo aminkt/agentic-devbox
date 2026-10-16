@@ -1,0 +1,6 @@
+{
+  "agents": {
+    "claude": { "settings": { "model": "opus" } },
+    "copilot": { "enabled": false }
+  }
+}

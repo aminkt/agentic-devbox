@@ -1,0 +1,205 @@
+#!/usr/bin/env node
+// agentic-devbox-config: applies and inspects the sandbox's declarative configuration.
+//
+//   agentic-devbox-config apply              Apply MCP + settings layers to every agent (run at start).
+//   agentic-devbox-config show [agent]       Print the merged layers and what each agent receives.
+//   agentic-devbox-config doctor             Check browser, agents, credentials and state folder.
+//   agentic-devbox-config mcp-check [name]   Start each MCP server and list its tools (live handshake).
+//   agentic-devbox-config prewarm <file>     Pre-download the npx/uvx MCP servers listed in <file>.
+//   agentic-devbox-config healthcheck        Exit 0 when the sandbox is ready (Docker HEALTHCHECK).
+
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import { applyAll, desiredFiles, makeContext } from '../lib/apply.mjs';
+import { adapters } from '../lib/adapters.mjs';
+import { readConfig } from '../lib/files.mjs';
+import { loadLayers } from '../lib/layers.mjs';
+import { checkServer } from '../lib/mcpcheck.mjs';
+
+const RUN_DIR = process.env.AGENTIC_DEVBOX_RUN ?? '/run/agentic-devbox';
+const STATE_DIR = process.env.AGENTIC_DEVBOX_STATE ?? `${process.env.HOME}/.agentic-devbox`;
+const CDP_URL = `http://127.0.0.1:${process.env.AGENTIC_DEVBOX_CDP_PORT ?? '9222'}`;
+
+const tty = process.stdout.isTTY;
+const color = (code) => (text) => (tty ? `\x1b[${code}m${text}\x1b[0m` : text);
+const green = color('32');
+const yellow = color('33');
+const red = color('31');
+const dim = color('2');
+
+function printWarnings(warnings) {
+  for (const w of warnings) console.error(yellow(`  ! ${w}`));
+}
+
+function cmdApply() {
+  const layers = loadLayers();
+  const { reports, warnings } = applyAll(layers);
+  const servers = Object.keys(layers.servers);
+  console.error(`[agentic-devbox] MCP servers: ${servers.length ? servers.join(', ') : '(none)'}`);
+  for (const r of reports) {
+    const status = r.error ? red('error') : r.disabled ? dim('disabled') : r.notInstalled ? dim('not installed') : green('configured');
+    console.error(`[agentic-devbox] ${r.name.padEnd(16)} ${status}${r.error ? `: ${r.error}` : ''}`);
+  }
+  printWarnings(warnings);
+  try {
+    fs.mkdirSync(RUN_DIR, { recursive: true });
+    fs.writeFileSync(`${RUN_DIR}/status.json`, JSON.stringify({ appliedAt: new Date().toISOString(), servers, reports, warnings }, null, 2));
+  } catch {
+    // Status is informational only.
+  }
+  return reports.some((r) => r.error) ? 1 : 0;
+}
+
+function cmdShow(agentId) {
+  const layers = loadLayers();
+  // Keep ${VAR} references visible instead of expanding secrets into the output.
+  const ctx = { env: process.env, cdpPort: process.env.AGENTIC_DEVBOX_CDP_PORT ?? '9222', warn: () => {}, expand: (v) => v };
+  const selected = adapters.filter((a) => !agentId || a.id === agentId);
+  if (agentId && selected.length === 0) {
+    console.error(`Unknown agent "${agentId}". Known: ${adapters.map((a) => a.id).join(', ')}`);
+    return 2;
+  }
+  console.log('Layers:');
+  for (const [label, file] of Object.entries(layers.sources)) {
+    console.log(`  ${label.padEnd(16)} ${file} ${fs.existsSync(file) ? '' : dim('(absent)')}`);
+  }
+  console.log('\nMCP servers (merged):');
+  for (const [name, def] of Object.entries(layers.servers)) {
+    const target = def.type === 'stdio' ? [def.command, ...def.args].join(' ') : def.url;
+    console.log(`  ${name.padEnd(18)} ${def.type.padEnd(5)} ${target}${def.agents ? dim(`  [${def.agents.join(', ')}]`) : ''}`);
+  }
+  for (const adapter of selected) {
+    console.log(`\n${adapter.name} (${adapter.id})${layers.agents[adapter.id]?.enabled === false ? dim(' disabled') : ''}`);
+    for (const [file, { format, content }] of desiredFiles(adapter, layers, ctx)) {
+      console.log(`  ${file} ${dim(`[${format}]`)}`);
+      console.log(
+        JSON.stringify(content, null, 2)
+          .split('\n')
+          .map((l) => `    ${l}`)
+          .join('\n'),
+      );
+    }
+  }
+  printWarnings(layers.warnings);
+  return 0;
+}
+
+async function cdpVersion() {
+  try {
+    const res = await fetch(`${CDP_URL}/json/version`, { signal: AbortSignal.timeout(2000) });
+    return res.ok ? await res.json() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function cmdDoctor() {
+  let problems = 0;
+  const ok = (msg) => console.log(`${green('✓')} ${msg}`);
+  const bad = (msg) => {
+    problems += 1;
+    console.log(`${red('✗')} ${msg}`);
+  };
+  const info = (msg) => console.log(`${dim('·')} ${msg}`);
+
+  console.log(`agentic-devbox doctor (uid ${process.getuid()})\n`);
+  try {
+    fs.accessSync(STATE_DIR, fs.constants.W_OK);
+    ok(`state folder writable: ${STATE_DIR}`);
+  } catch {
+    bad(`state folder not writable: ${STATE_DIR}`);
+  }
+
+  if (process.env.AGENTIC_DEVBOX_BROWSER === '0') {
+    info('headless browser disabled (AGENTIC_DEVBOX_BROWSER=0)');
+  } else {
+    const v = await cdpVersion();
+    if (v) ok(`Chrome DevTools at ${CDP_URL}: ${v.Browser}`);
+    else bad(`Chrome DevTools not reachable at ${CDP_URL} (see ${RUN_DIR}/chrome.log)`);
+  }
+
+  const status = readConfig(`${RUN_DIR}/status.json`);
+  console.log('');
+  for (const adapter of adapters) {
+    const r = spawnSync(adapter.bin, adapter.versionArgs ?? ['--version'], { encoding: 'utf8', timeout: 20000 });
+    const version = (r.stdout || r.stderr || '').trim().split('\n')[0];
+    if (r.status === 0) ok(`${adapter.name.padEnd(16)} ${version}`);
+    else bad(`${adapter.name.padEnd(16)} not runnable (${r.error?.message ?? version})`);
+    const creds = (adapter.credentials ?? []).filter((name) => process.env[name]);
+    if (creds.length) info(`  credentials from env: ${creds.join(', ')}`);
+    else if (adapter.loginFile && fs.existsSync(adapter.loginFile)) info(`  signed in (${adapter.loginFile})`);
+    else if (adapter.loginFile) info(`  not signed in yet: ${adapter.loginHint}`);
+    else info(`  sign in: ${adapter.loginHint}`);
+    const report = status?.reports?.find((x) => x.id === adapter.id);
+    if (report?.error) bad(`  config: ${report.error}`);
+  }
+
+  if (status?.warnings?.length) {
+    console.log('\nWarnings from the last apply:');
+    printWarnings(status.warnings);
+  }
+  console.log(problems ? red(`\n${problems} problem(s) found.`) : green('\nAll checks passed.'));
+  return problems ? 1 : 0;
+}
+
+// Downloads packages into the cache without starting the servers:
+// npx packages via `npm exec --package=<pkg> -- true`, uvx packages via `uvx <spec> --help`.
+function cmdPrewarm(file) {
+  const doc = readConfig(file) ?? {};
+  for (const [name, def] of Object.entries(doc.mcpServers ?? {})) {
+    const args = def.args ?? [];
+    let cmd;
+    if (def.command === 'npx') {
+      const pkg = args.find((a) => !a.startsWith('-'));
+      if (pkg) cmd = ['npm', ['exec', '--yes', `--package=${pkg}`, '--', 'true']];
+    } else if (def.command === 'uvx') {
+      const spec = args.find((a) => !a.startsWith('-'));
+      if (spec) cmd = ['uvx', [spec, '--help']];
+    }
+    if (!cmd) continue;
+    const r = spawnSync(cmd[0], cmd[1], { stdio: ['ignore', 'ignore', 'pipe'], timeout: 300000, encoding: 'utf8' });
+    console.log(`prewarm ${name}: ${r.status === 0 ? 'ok' : `skipped (${(r.stderr || r.error?.message || '').trim().split('\n').at(-1)})`}`);
+  }
+  return 0;
+}
+
+async function cmdMcpCheck(only) {
+  const layers = loadLayers();
+  const warnings = [];
+  const ctx = makeContext(warnings);
+  const names = Object.keys(layers.servers).filter((n) => !only || n === only);
+  if (only && names.length === 0) {
+    console.error(`No MCP server named "${only}". Configured: ${Object.keys(layers.servers).join(', ')}`);
+    return 2;
+  }
+  const results = await Promise.all(names.map(async (name) => [name, await checkServer(layers.servers[name], ctx)]));
+  for (const [name, r] of results) {
+    const tools = r.tools && `${r.tools.length} tool${r.tools.length === 1 ? '' : 's'}: ${r.tools.slice(0, 6).join(', ')}${r.tools.length > 6 ? ', …' : ''}`;
+    if (r.ok) console.log(`${green('✓')} ${name.padEnd(18)} ${tools ?? 'reachable'}`);
+    else console.log(`${red('✗')} ${name.padEnd(18)} ${r.error}`);
+  }
+  printWarnings(warnings);
+  return results.every(([, r]) => r.ok) ? 0 : 1;
+}
+
+async function cmdHealthcheck() {
+  if (!fs.existsSync(`${RUN_DIR}/status.json`)) return 1;
+  if (process.env.AGENTIC_DEVBOX_BROWSER === '0') return 0;
+  return (await cdpVersion()) ? 0 : 1;
+}
+
+const [command = 'show', ...rest] = process.argv.slice(2);
+const commands = {
+  apply: cmdApply,
+  show: () => cmdShow(rest[0]),
+  doctor: cmdDoctor,
+  'mcp-check': () => cmdMcpCheck(rest[0]),
+  prewarm: () => cmdPrewarm(rest[0] ?? '/opt/agentic-devbox/share/mcp-global.default.json'),
+  healthcheck: cmdHealthcheck,
+};
+
+if (!commands[command]) {
+  console.error(`Usage: agentic-devbox-config <${Object.keys(commands).join('|')}>`);
+  process.exit(2);
+}
+process.exitCode = await commands[command]();

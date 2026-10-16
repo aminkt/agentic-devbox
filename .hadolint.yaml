@@ -1,0 +1,6 @@
+# Intentional deviations, each with a reason:
+ignored:
+  # Apt packages track the Debian release; pinning every version would break on each point release.
+  - DL3008
+  # Agent CLIs default to `latest` on purpose and are pinnable with build args.
+  - DL3016

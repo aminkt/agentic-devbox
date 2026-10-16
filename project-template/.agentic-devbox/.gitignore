@@ -1,0 +1,5 @@
+# Commit the declarative config (mcp-project.json, settings-project.json).
+# Never commit tool state or secrets: home/ holds logins and session history.
+home/*
+!home/.gitkeep
+secrets.env

@@ -1,0 +1,6 @@
+{
+  "agents": {
+    "claude": { "settings": { "permissions": { "deny": ["Read(./.env)"] } } },
+    "opencode": { "settings": { "share": "disabled" } }
+  }
+}

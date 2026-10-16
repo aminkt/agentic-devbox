@@ -1,0 +1,201 @@
+# agentic-devbox: one image for every AI coding agent.
+#
+#   Claude Code · GitHub Copilot CLI · Antigravity CLI (agy) · OpenAI Codex CLI · OpenCode
+#   + headless Google Chrome with DevTools on :9222
+#   + Node.js LTS / npx and Python / uvx for running MCP servers on demand
+#
+# The image is built once per machine (see base-compose.yml) and shared by every
+# project, while all runtime state lives in each project's own bind mount.
+#
+# Build manually:
+#   docker build -f Dockerfile.agents -t agentic-devbox:local \
+#     --build-arg AGENT_UID="$(id -u)" --build-arg AGENT_GID="$(id -g)" .
+
+ARG NODE_MAJOR=24
+ARG DEBIAN_CODENAME=trixie
+# Global so both stages share one default; the CLI passes your uid/gid on Linux.
+ARG AGENT_UID=1000
+ARG AGENT_GID=1000
+
+FROM node:${NODE_MAJOR}-${DEBIAN_CODENAME}-slim AS tools
+
+ARG TARGETARCH
+ARG UV_VERSION=0.13.1
+ARG UV_SHA256_AMD64=eadd9d27c134ab5ac1ffd4473b97a741407f3ea238288f03121fc4deddf90220
+ARG UV_SHA256_ARM64=9041c73c99fdc5892cf128140beb354eca9231d502068cc36e6cb53a8e59ad14
+ARG AGENT_UID
+ARG AGENT_GID
+# Agent CLIs to install (any subset). Adapters skip agents that are not installed.
+ARG AGENTIC_DEVBOX_AGENTS="claude copilot agy codex opencode"
+ARG CLAUDE_CODE_VERSION=latest
+ARG COPILOT_VERSION=latest
+ARG CODEX_VERSION=latest
+ARG OPENCODE_VERSION=latest
+
+LABEL org.opencontainers.image.title="agentic-devbox" \
+      org.opencontainers.image.description="Isolated multi-agent sidecar: Claude Code, Copilot CLI, Antigravity CLI, Codex, OpenCode, headless Chrome and MCP" \
+      org.opencontainers.image.source="https://github.com/aminkt/agentic-devbox" \
+      org.opencontainers.image.licenses="MIT"
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# Agents are updated by rebuilding the image (`agentic-devbox update`), never in place.
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    TZ=UTC \
+    DISABLE_AUTOUPDATER=1 \
+    COPILOT_AUTO_UPDATE=false
+
+# --- Base toolchain ---------------------------------------------------------------
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      bash-completion bind9-dnsutils build-essential ca-certificates curl fd-find file \
+      git gnupg iproute2 iputils-ping jq less lsof make nano netcat-openbsd openssh-client \
+      pipx postgresql-client procps python3 python3-dev python3-pip python3-venv ripgrep \
+      socat sqlite3 tini tree unzip vim-tiny wget xz-utils zip \
+      fonts-liberation fonts-noto-color-emoji \
+ && ln -s /usr/bin/fdfind /usr/local/bin/fd \
+ && rm -rf /var/lib/apt/lists/*
+
+# --- GitHub CLI (signed apt repository) ---------------------------------------------
+RUN install -d -m 0755 /etc/apt/keyrings \
+ && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+ && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+ && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends gh \
+ && rm -rf /var/lib/apt/lists/*
+
+# --- Google Chrome Stable (amd64 + arm64) ---------------------------------------------
+# Google publishes linux/arm64 builds since mid-2026. If that download ever fails on
+# arm64, fall back to Debian's Chromium so Apple Silicon builds keep working.
+RUN arch="${TARGETARCH:-$(dpkg --print-architecture)}" \
+ && case "${arch}" in amd64|arm64) ;; *) echo "Unsupported architecture: ${arch}" >&2; exit 1 ;; esac \
+ && apt-get update \
+ && if curl -fsSLo /tmp/google-chrome.deb "https://dl.google.com/linux/direct/google-chrome-stable_current_${arch}.deb"; then \
+      apt-get install -y --no-install-recommends /tmp/google-chrome.deb \
+      && ln -sf /usr/bin/google-chrome-stable /usr/local/bin/agentic-devbox-chrome; \
+    elif [ "${arch}" = "arm64" ]; then \
+      echo "Google Chrome arm64 package unavailable; installing Debian Chromium instead." >&2 \
+      && apt-get install -y --no-install-recommends chromium \
+      && ln -sf /usr/bin/chromium /usr/local/bin/agentic-devbox-chrome; \
+    else \
+      echo "Failed to download Google Chrome for ${arch}" >&2; exit 1; \
+    fi \
+ && rm -f /tmp/google-chrome.deb \
+ && rm -rf /var/lib/apt/lists/* \
+ && agentic-devbox-chrome --version
+
+# --- uv / uvx for Python-based MCP servers (pinned release, checksum-verified) -------
+RUN arch="${TARGETARCH:-$(dpkg --print-architecture)}" \
+ && case "${arch}" in \
+      amd64) triple=x86_64-unknown-linux-gnu; sha="${UV_SHA256_AMD64}" ;; \
+      arm64) triple=aarch64-unknown-linux-gnu; sha="${UV_SHA256_ARM64}" ;; \
+    esac \
+ && curl -fsSLo /tmp/uv.tar.gz "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${triple}.tar.gz" \
+ && echo "${sha}  /tmp/uv.tar.gz" | sha256sum -c - \
+ && tar -xzf /tmp/uv.tar.gz -C /usr/local/bin --strip-components=1 "uv-${triple}/uv" "uv-${triple}/uvx" \
+ && rm -f /tmp/uv.tar.gz \
+ && uv --version
+
+# --- Agent CLIs ---------------------------------------------------------------------
+# Changing AGENT_TOOLS_REFRESH (agentic-devbox update does) re-installs the `latest` versions.
+ARG AGENT_TOOLS_REFRESH=0
+# ${pkgs} is split into words on purpose: one npm argument per package.
+# hadolint ignore=SC2086
+RUN echo "agent tools refresh: ${AGENT_TOOLS_REFRESH}" \
+ && pkgs="" \
+ && for agent in ${AGENTIC_DEVBOX_AGENTS}; do \
+      case "${agent}" in \
+        claude) pkgs="${pkgs} @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" ;; \
+        copilot) pkgs="${pkgs} @github/copilot@${COPILOT_VERSION}" ;; \
+        codex) pkgs="${pkgs} @openai/codex@${CODEX_VERSION}" ;; \
+        opencode) pkgs="${pkgs} opencode-ai@${OPENCODE_VERSION}" ;; \
+        agy) ;; \
+        *) echo "Unknown agent in AGENTIC_DEVBOX_AGENTS: ${agent}" >&2; exit 1 ;; \
+      esac; \
+    done \
+ && if [ -n "${pkgs}" ]; then npm install -g --no-fund --no-audit ${pkgs}; fi \
+ && for agent in ${AGENTIC_DEVBOX_AGENTS}; do [ "${agent}" = agy ] || "${agent}" --version; done \
+ && npm cache clean --force \
+ && rm -rf /root/.npm /root/.cache
+
+# Antigravity CLI: native binary, checksum-verified by the official installer.
+RUN case " ${AGENTIC_DEVBOX_AGENTS} " in \
+      *" agy "*) \
+        curl -fsSL https://antigravity.google/cli/install.sh | bash -s -- --dir /usr/local/bin \
+        && agy --version \
+        && rm -rf /root/.cache /root/.gemini ;; \
+    esac
+
+# --- VS Code CLI (static build, as `vscode-cli` so it never shadows VS Code's own `code`)
+# Used for VS Code in the browser (`serve-web`); see docs/vscode.md. Declared here, not at
+# the top, so changing it does not invalidate the cache of the layers above.
+ARG AGENTIC_DEVBOX_VSCODE_CLI=true
+RUN if [ "${AGENTIC_DEVBOX_VSCODE_CLI}" = "true" ]; then \
+      arch="${TARGETARCH:-$(dpkg --print-architecture)}" \
+      && case "${arch}" in amd64) cli="cli-alpine-x64" ;; arm64) cli="cli-alpine-arm64" ;; esac \
+      && curl -fsSLo /tmp/vscode-cli.tar.gz "https://update.code.visualstudio.com/latest/${cli}/stable" \
+      && tar -xzf /tmp/vscode-cli.tar.gz -C /tmp code \
+      && install -m 0755 /tmp/code /usr/local/bin/vscode-cli \
+      && rm -f /tmp/vscode-cli.tar.gz /tmp/code \
+      && vscode-cli --version; \
+    fi
+
+# --- Unprivileged agent user (UID/GID match the host user on Linux) ------------------
+RUN userdel --remove node \
+ && if ! getent group "${AGENT_GID}" >/dev/null; then groupadd --gid "${AGENT_GID}" agent; fi \
+ && useradd --uid "${AGENT_UID}" --gid "${AGENT_GID}" --create-home --shell /bin/bash agent
+
+# --- agentic-devbox runtime --------------------------------------------------------------
+FROM tools AS agentic-devbox
+
+ARG AGENT_UID
+ARG AGENT_GID
+
+COPY runtime/package.json runtime/package-lock.json /opt/agentic-devbox/
+RUN npm ci --prefix /opt/agentic-devbox --omit=dev --no-fund --no-audit \
+ && npm cache clean --force
+COPY runtime/ /opt/agentic-devbox/
+COPY mcp-global.json /opt/agentic-devbox/share/mcp-global.default.json
+RUN chmod 0755 /opt/agentic-devbox/entrypoint.sh /opt/agentic-devbox/bin/* \
+ && ln -s /opt/agentic-devbox/profile.d/agentic-devbox.sh /etc/profile.d/agentic-devbox.sh
+
+ENV PATH=/opt/agentic-devbox/bin:${PATH} \
+    NODE_PATH=/opt/agentic-devbox/node_modules \
+    AGENTIC_DEVBOX_STATE=/home/agent/.agentic-devbox \
+    AGENTIC_DEVBOX_RUN=/run/agentic-devbox \
+    AGENTIC_DEVBOX_CDP_PORT=9222 \
+    CLAUDE_CONFIG_DIR=/home/agent/.agentic-devbox/claude \
+    CHROME_PATH=/usr/local/bin/agentic-devbox-chrome \
+    PUPPETEER_EXECUTABLE_PATH=/usr/local/bin/agentic-devbox-chrome \
+    PUPPETEER_SKIP_DOWNLOAD=1 \
+    PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+    CHROME_DEVTOOLS_MCP_NO_USAGE_STATISTICS=1 \
+    CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS=1 \
+    npm_config_cache=/home/agent/.cache/npm \
+    npm_config_update_notifier=false \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    EDITOR=nano
+
+USER ${AGENT_UID}:${AGENT_GID}
+WORKDIR /workspace
+
+# Pre-download the default MCP servers so the first agent session starts instantly.
+# The cache lands in ~/.cache, which seeds each project's own cache volume.
+# Folders that projects or volumes mount into must exist with the agent's ownership,
+# or Docker creates them as root and the agent cannot add its own links next to them.
+RUN mkdir -p /home/agent/.agentic-devbox /home/agent/.cache /home/agent/.vscode-server \
+      /home/agent/.config /home/agent/.local/share /home/agent/.local/state \
+ && agentic-devbox-config prewarm /opt/agentic-devbox/share/mcp-global.default.json
+
+EXPOSE 9222
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
+  CMD ["agentic-devbox-config", "healthcheck"]
+
+ENTRYPOINT ["/usr/bin/tini", "-g", "--", "/opt/agentic-devbox/entrypoint.sh"]
+CMD ["sleep", "infinity"]

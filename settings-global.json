@@ -1,0 +1,31 @@
+{
+  "$schema": "https://raw.githubusercontent.com/aminkt/agentic-devbox/main/schema/settings.schema.json",
+  "agents": {
+    "claude": {
+      "enabled": true,
+      "settings": {
+        "permissions": {
+          "deny": ["Read(./.env)", "Read(./.env.*)", "Read(./**/.env)", "Read(./**/.env.*)", "Read(./**/secrets/**)"]
+        }
+      }
+    },
+    "copilot": {
+      "enabled": true,
+      "settings": {}
+    },
+    "agy": {
+      "enabled": true,
+      "settings": {}
+    },
+    "codex": {
+      "enabled": true,
+      "settings": {}
+    },
+    "opencode": {
+      "enabled": true,
+      "settings": {
+        "share": "disabled"
+      }
+    }
+  }
+}

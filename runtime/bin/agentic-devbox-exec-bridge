@@ -1,0 +1,201 @@
+#!/usr/bin/env node
+// agentic-devbox-exec-bridge: lets the agent sidecar run `docker exec` into the other
+// containers of its own Compose project, without giving the sidecar the Docker socket.
+//
+//   agentic-devbox-exec-bridge serve
+//
+// Runs in its own container (see exec-bridge.yml). It listens on a unix socket in a
+// volume shared only with the sidecar, and accepts two requests: run a command in a
+// container of this Compose project (exec), and list those containers (ps).
+//
+// Environment:
+//   AGENTIC_DEVBOX_BRIDGE_USERS         non-root (default): refuse root and sudo-capable users;
+//                                      any: allow every user, like `docker exec` on the host
+//   AGENTIC_DEVBOX_BRIDGE_DEFAULT_USER  user for requests without -u; empty means the container
+//                                      default (default in non-root mode: 1000:1000)
+//   AGENTIC_DEVBOX_BRIDGE_DENY_USERS    extra users refused in non-root mode, comma-separated,
+//                                      e.g. users with passwordless sudo (default: none)
+//   AGENTIC_DEVBOX_BRIDGE_SOCKET        listen path (default /run/agent-exec-bridge/bridge.sock)
+
+import fs from 'node:fs';
+import net from 'node:net';
+import os from 'node:os';
+import { DEFAULT_BRIDGE_SOCKET, DockerClient, DockerStreamDemuxer, encodeFrame, FRAME, FrameDecoder } from '../lib/bridge.mjs';
+
+const socketPath = process.env.AGENTIC_DEVBOX_BRIDGE_SOCKET ?? DEFAULT_BRIDGE_SOCKET;
+const policy = process.env.AGENTIC_DEVBOX_BRIDGE_USERS === 'any' ? 'any' : 'non-root';
+const defaultUser = process.env.AGENTIC_DEVBOX_BRIDGE_DEFAULT_USER ?? (policy === 'any' ? '' : '1000:1000');
+const deniedUsers = new Set(['root', '0', ...(process.env.AGENTIC_DEVBOX_BRIDGE_DENY_USERS ?? '').split(',').map((u) => u.trim()).filter(Boolean)]);
+const docker = new DockerClient(process.env.DOCKER_SOCKET ?? '/var/run/docker.sock');
+
+const log = (msg) => console.log(`${new Date().toISOString()} ${msg}`);
+
+let self;
+let project;
+
+async function identify() {
+  self = await docker.request('GET', `/containers/${os.hostname()}/json`);
+  project = self.Config?.Labels?.['com.docker.compose.project'];
+  if (!project) throw new Error('the bridge must run as a Docker Compose service (no com.docker.compose.project label found)');
+}
+
+async function projectContainers() {
+  const filters = encodeURIComponent(JSON.stringify({ label: [`com.docker.compose.project=${project}`] }));
+  const list = await docker.request('GET', `/containers/json?all=true&filters=${filters}`);
+  return list
+    .filter((c) => c.Id !== self.Id)
+    .map((c) => ({
+      id: c.Id,
+      name: c.Names?.[0]?.replace(/^\//, '') ?? c.Id.slice(0, 12),
+      service: c.Labels?.['com.docker.compose.service'] ?? '',
+      image: c.Image,
+      state: c.State,
+      status: c.Status,
+    }));
+}
+
+async function resolveTarget(target) {
+  const all = await projectContainers();
+  const running = all.filter((c) => c.state === 'running');
+  const match = running.find((c) => c.name === target || c.id.startsWith(target)) ?? running.find((c) => c.service === target);
+  if (match) return match;
+  const known = running.map((c) => (c.service && c.service !== c.name ? `${c.name} (service ${c.service})` : c.name)).join(', ');
+  throw new Error(`no running container or service "${target}" in Compose project "${project}". Running: ${known || 'none'}`);
+}
+
+function checkUser(user) {
+  if (policy === 'any') return;
+  const name = (user || '').split(':')[0];
+  if (!name) throw new Error('the bridge runs in non-root mode and this container defaults to root; pass -u <user>');
+  if (deniedUsers.has(name)) throw new Error(`user "${name}" is not allowed in non-root mode (AGENTIC_DEVBOX_BRIDGE_USERS=non-root)`);
+}
+
+function validate(req) {
+  const strings = (a) => Array.isArray(a) && a.every((s) => typeof s === 'string');
+  if (req.op === 'ps') return;
+  if (req.op !== 'exec') throw new Error(`unsupported operation "${req.op}"`);
+  if (typeof req.target !== 'string' || !req.target) throw new Error('missing target container');
+  if (!strings(req.cmd) || req.cmd.length === 0) throw new Error('missing command');
+  if (req.env !== undefined && !strings(req.env)) throw new Error('env must be a list of KEY=VALUE strings');
+}
+
+async function handleExec(req, client, send) {
+  const container = await resolveTarget(req.target);
+  const user = req.user || defaultUser;
+  checkUser(user || (await containerDefaultUser(container.id)));
+
+  const exec = await docker.request('POST', `/containers/${container.id}/exec`, {
+    AttachStdin: Boolean(req.stdin) && !req.detach,
+    AttachStdout: !req.detach,
+    AttachStderr: !req.detach,
+    Tty: Boolean(req.tty),
+    Cmd: req.cmd,
+    User: user || undefined,
+    WorkingDir: req.workdir || undefined,
+    Env: req.env,
+    Privileged: false,
+  });
+  log(`exec ${container.name} user=${user || '(default)'} tty=${Boolean(req.tty)} cmd=${JSON.stringify(req.cmd).slice(0, 300)}`);
+
+  if (req.detach) {
+    await docker.request('POST', `/exec/${exec.Id}/start`, { Detach: true, Tty: Boolean(req.tty) });
+    send(FRAME.EXIT, { code: 0 });
+    return;
+  }
+
+  const { socket, head } = await docker.startExec(exec.Id, Boolean(req.tty));
+  const resize = (size) =>
+    size?.cols && size?.rows && docker.request('POST', `/exec/${exec.Id}/resize?h=${size.rows}&w=${size.cols}`).catch(() => {});
+  if (req.tty) resize(req);
+
+  const demux = req.tty ? null : new DockerStreamDemuxer((stream, data) => send(stream === 'stderr' ? FRAME.STDERR : FRAME.STDOUT, data));
+  const forward = (chunk) => (demux ? demux.push(chunk) : send(FRAME.STDOUT, chunk));
+  if (head?.length) forward(head);
+  socket.on('data', forward);
+
+  // Stdin that arrived while the exec was being created is replayed first.
+  client.write = (data) => socket.write(data);
+  client.end = () => socket.end();
+  for (const [kind, data] of client.queue.splice(0)) kind === 'data' ? client.write(data) : client.end();
+  client.onResize = resize;
+  client.onClose = () => socket.destroy();
+
+  await new Promise((resolve) => socket.on('close', resolve));
+  const info = await docker.request('GET', `/exec/${exec.Id}/json`);
+  send(FRAME.EXIT, { code: info.ExitCode ?? 1 });
+}
+
+async function containerDefaultUser(id) {
+  const info = await docker.request('GET', `/containers/${id}/json`);
+  return info.Config?.User ?? '';
+}
+
+function serve(connection) {
+  const client = { queue: [] };
+  let started = false;
+  const send = (type, payload) => {
+    if (!connection.destroyed) connection.write(encodeFrame(type, payload));
+  };
+  const fail = (err) => {
+    send(FRAME.ERROR, err.message);
+    send(FRAME.EXIT, { code: 126 });
+    connection.end();
+  };
+
+  const decoder = new FrameDecoder((type, payload) => {
+    if (type === FRAME.REQUEST && !started) {
+      started = true;
+      let req;
+      try {
+        req = JSON.parse(payload.toString('utf8'));
+        validate(req);
+      } catch (err) {
+        fail(err);
+        return;
+      }
+      const run =
+        req.op === 'ps'
+          ? projectContainers().then((list) => {
+              send(FRAME.RESULT, { project, containers: list });
+              send(FRAME.EXIT, { code: 0 });
+            })
+          : handleExec(req, client, send);
+      run.then(() => connection.end(), fail);
+    } else if (type === FRAME.STDIN) client.write ? client.write(payload) : client.queue.push(['data', payload]);
+    else if (type === FRAME.STDIN_END) client.end ? client.end() : client.queue.push(['end']);
+    else if (type === FRAME.RESIZE) client.onResize?.(JSON.parse(payload.toString('utf8')));
+  });
+
+  connection.on('data', (chunk) => {
+    try {
+      decoder.push(chunk);
+    } catch (err) {
+      fail(err);
+    }
+  });
+  connection.on('close', () => client.onClose?.());
+  connection.on('error', () => client.onClose?.());
+}
+
+async function main() {
+  if (process.argv[2] !== 'serve') {
+    console.error('Usage: agentic-devbox-exec-bridge serve');
+    process.exit(2);
+  }
+  await identify();
+  fs.rmSync(socketPath, { force: true });
+  const server = net.createServer(serve);
+  server.listen(socketPath, () => {
+    // Only containers that mount the bridge volume (the sidecar) can reach this socket.
+    fs.chmodSync(socketPath, 0o666);
+    log(`exec bridge for Compose project "${project}" on ${socketPath} (users: ${policy})`);
+  });
+  const stop = () => server.close(() => process.exit(0));
+  process.on('SIGTERM', stop);
+  process.on('SIGINT', stop);
+}
+
+main().catch((err) => {
+  console.error(`exec bridge failed to start: ${err.message}`);
+  process.exit(1);
+});

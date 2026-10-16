@@ -1,0 +1,14 @@
+# DBHub (Postgres MCP server) configuration for this project.
+# Mounted read-only at /etc/agentic-devbox/project/dbhub.toml; see mcp-project.json.
+# DBHub resolves ${PROJECT_DB_URL} from the server's environment, so no credentials live here.
+
+[[sources]]
+id = "app"
+description = "Example app database (read-only role agent_ro)"
+dsn = "${PROJECT_DB_URL}"
+
+[[tools]]
+name = "execute_sql"
+source = "app"
+readonly = true
+max_rows = 500

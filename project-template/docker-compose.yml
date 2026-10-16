@@ -1,0 +1,77 @@
+# Example project using agentic-devbox.
+#
+#   docker compose up -d                                   # app + db + agent sidecar
+#   docker compose exec universal-agent claude             # or: agy, copilot, codex, opencode
+#   docker compose exec universal-agent devbox-browser screenshot http://localhost:3000
+#
+# The sidecar comes from the shared blueprint. It is included by reference, never copied,
+# so `agentic-devbox update` reaches every project at once.
+
+name: agentic-devbox-example
+
+# >>> agentic-devbox include
+include:
+  - path: ${AGENTIC_DEVBOX_HOME:-${HOME}/.config/agentic-devbox}/base-compose.yml
+    # Resolve the blueprint's relative paths (./, ./.agentic-devbox) against this project.
+    project_directory: .
+# <<< agentic-devbox include
+
+services:
+  app:
+    image: node:24-trixie-slim
+    working_dir: /app
+    # --watch restarts the server whenever an agent edits the code.
+    command: ["node", "--watch", "server.js"]
+    environment:
+      PORT: "3000"
+    volumes:
+      - ./app:/app:ro
+    ports:
+      # The agent shares this network namespace, so publish every port here, on loopback only.
+      - "127.0.0.1:3000:3000"
+      # Uncomment (and set AGENTIC_DEVBOX_CDP_EXPOSE=1) to inspect the agent's Chrome from the host
+      # at http://localhost:9223 or chrome://inspect.
+      # - "127.0.0.1:9223:9223"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app-dev-only
+    volumes:
+      - db-data:/var/lib/postgresql
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Project-specific overrides for the shared sidecar. Compose merges these into the
+  # included definition: lists and maps are merged, scalars are replaced.
+  universal-agent:
+    # Join the app's network namespace: the agents and their headless Chrome reach the app
+    # at http://localhost:3000, and the db by its service name.
+    network_mode: "service:app"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # Used by .agentic-devbox/mcp-project.json. The read-only role comes from db/init.sql.
+      PROJECT_DB_URL: postgres://agent_ro:agent_ro@db:5432/app
+    # base-compose.yml already mounts:
+    #   .                              → /workspace (rw)
+    #   .agentic-devbox/                → /etc/agentic-devbox/project (ro; mcp-project.json, settings-project.json)
+    #   .agentic-devbox/home/           → /home/agent/.agentic-devbox (tool logins, sessions, native configs)
+    # To keep the MCP file elsewhere, mount it over the default path:
+    # volumes:
+    #   - ./config/mcp-project.json:/etc/agentic-devbox/project/mcp-project.json:ro
+
+volumes:
+  db-data: {}

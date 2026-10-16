@@ -1,0 +1,98 @@
+#!/usr/bin/env node
+// `docker` inside the agent sidecar. There is no Docker socket here: this command sends
+// `docker exec`, `docker compose exec` and `docker ps` to the exec bridge (see
+// exec-bridge.yml and docs/exec-bridge.md), which runs them in the other containers of
+// the same Compose project. Also installed as `docker-compose`.
+
+import net from 'node:net';
+import path from 'node:path';
+import { DEFAULT_BRIDGE_SOCKET, encodeFrame, FRAME, FrameDecoder } from '../lib/bridge.mjs';
+import { formatPs, parseDockerArgs } from '../lib/dockercli.mjs';
+
+const socketPath = process.env.AGENTIC_DEVBOX_BRIDGE_SOCKET ?? DEFAULT_BRIDGE_SOCKET;
+const invokedAs = path.basename(process.argv[1]);
+
+function die(message, code = 1) {
+  process.stderr.write(`${invokedAs}: ${message}\n`);
+  process.exit(code);
+}
+
+let request;
+try {
+  request = parseDockerArgs(process.argv.slice(2), invokedAs);
+} catch (err) {
+  die(err.message, 125);
+}
+
+if (request.op === 'help') {
+  process.stdout.write(`Usage inside agentic-devbox (forwarded to the exec bridge):
+  docker exec [-i] [-t] [-u USER] [-w DIR] [-e K=V] CONTAINER COMMAND [ARG...]
+  docker compose exec [-T] [-u USER] [-w DIR] [-e K=V] SERVICE COMMAND [ARG...]
+  docker ps [--format TEMPLATE] [-q]
+Only containers of this sidecar's Compose project are reachable.
+`);
+  process.exit(0);
+}
+if (request.op === 'version') {
+  process.stdout.write('agentic-devbox docker bridge client (supports exec and ps)\n');
+  process.exit(0);
+}
+
+// A TTY is only allocated when this terminal is one; `-it` from a script still works.
+const terminal = Boolean(process.stdin.isTTY && process.stdout.isTTY);
+const tty = request.op === 'exec' && request.ttyRequested && terminal && !request.detach;
+const attachStdin = request.op === 'exec' && request.interactive && !request.detach;
+if (request.privileged) process.stderr.write(`${invokedAs}: --privileged is ignored by the agentic-devbox bridge\n`);
+
+const connection = net.connect(socketPath);
+connection.on('error', (err) => {
+  if (err.code === 'ENOENT' || err.code === 'ECONNREFUSED') {
+    die(`the exec bridge is not running (${socketPath}). Include exec-bridge.yml in this project's compose file: see docs/exec-bridge.md`, 125);
+  }
+  die(err.message, 125);
+});
+
+let exitCode = 1;
+let gotExit = false;
+const restoreTerminal = () => {
+  if (tty && process.stdin.isTTY) process.stdin.setRawMode(false);
+};
+
+const decoder = new FrameDecoder((type, payload) => {
+  if (type === FRAME.STDOUT) process.stdout.write(payload);
+  else if (type === FRAME.STDERR) process.stderr.write(payload);
+  else if (type === FRAME.ERROR) process.stderr.write(`${invokedAs}: ${payload.toString('utf8')}\n`);
+  else if (type === FRAME.RESULT) {
+    const { containers } = JSON.parse(payload.toString('utf8'));
+    const shown = request.all ? containers : containers.filter((c) => c.state === 'running');
+    const text = formatPs(shown, request);
+    if (text) process.stdout.write(`${text}\n`);
+  } else if (type === FRAME.EXIT) {
+    gotExit = true;
+    exitCode = JSON.parse(payload.toString('utf8')).code;
+  }
+});
+
+connection.on('data', (chunk) => decoder.push(chunk));
+connection.on('close', () => {
+  restoreTerminal();
+  if (!gotExit) process.stderr.write(`${invokedAs}: connection to the exec bridge closed unexpectedly\n`);
+  process.exit(gotExit ? exitCode : 125);
+});
+
+connection.on('connect', () => {
+  const size = tty ? { cols: process.stdout.columns, rows: process.stdout.rows } : {};
+  const { op, target, cmd, user, workdir, env, detach } = request;
+  connection.write(encodeFrame(FRAME.REQUEST, { op, target, cmd, user, workdir, env, detach, tty, stdin: attachStdin, ...size }));
+
+  if (attachStdin) {
+    if (tty) process.stdin.setRawMode(true);
+    process.stdin.on('data', (data) => connection.write(encodeFrame(FRAME.STDIN, data)));
+    process.stdin.on('end', () => connection.write(encodeFrame(FRAME.STDIN_END)));
+  } else if (op === 'exec') {
+    connection.write(encodeFrame(FRAME.STDIN_END));
+  }
+  if (tty) {
+    process.stdout.on('resize', () => connection.write(encodeFrame(FRAME.RESIZE, { cols: process.stdout.columns, rows: process.stdout.rows })));
+  }
+});

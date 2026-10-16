@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/aminkt/agentic-devbox/main/schema/settings.schema.json",
+  "title": "agentic-devbox settings layer (settings-global.json / settings-project.json)",
+  "description": "Per-agent settings merged into each agent's native settings file at container start. The project layer wins over the global layer.",
+  "type": "object",
+  "properties": {
+    "$schema": { "type": "string" },
+    "agents": {
+      "type": "object",
+      "properties": {
+        "claude": { "$ref": "#/$defs/agent", "description": "Merged into $CLAUDE_CONFIG_DIR/settings.json." },
+        "copilot": { "$ref": "#/$defs/agent", "description": "Merged into ~/.copilot/settings.json." },
+        "agy": { "$ref": "#/$defs/agent", "description": "Merged into ~/.gemini/antigravity-cli/settings.json." },
+        "codex": { "$ref": "#/$defs/agent", "description": "Merged into ~/.codex/config.toml (written as TOML)." },
+        "opencode": { "$ref": "#/$defs/agent", "description": "Merged into ~/.config/opencode/opencode.json." }
+      },
+      "additionalProperties": { "$ref": "#/$defs/agent" }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "agent": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean", "description": "false skips configuring this agent." },
+        "settings": { "type": "object", "description": "Native settings keys for this agent." }
+      },
+      "additionalProperties": false
+    }
+  }
+}

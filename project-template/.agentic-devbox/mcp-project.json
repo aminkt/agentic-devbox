@@ -1,0 +1,19 @@
+{
+  "$schema": "https://raw.githubusercontent.com/aminkt/agentic-devbox/main/schema/mcp.schema.json",
+  "mcpServers": {
+    "postgres": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@bytebase/dbhub@1.5.0",
+        "--transport",
+        "stdio",
+        "--config",
+        "/etc/agentic-devbox/project/dbhub.toml"
+      ],
+      "env": {
+        "PROJECT_DB_URL": "${PROJECT_DB_URL}"
+      }
+    }
+  }
+}

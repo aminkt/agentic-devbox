@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# agentic-devbox: host CLI for the multi-agent Docker sidecar.
+#
+# A thin wrapper around `docker compose`: each command maps to plain docker commands
+# you can also run yourself. Run `agentic-devbox help` for the command list.
+set -euo pipefail
+
+self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
+AGENTIC_DEVBOX_HOME="${AGENTIC_DEVBOX_HOME:-$(cd "$(dirname "${self}")/.." && pwd)}"
+export AGENTIC_DEVBOX_HOME
+
+IMAGE="agentic-devbox:local"
+SERVICE="universal-agent"
+AGENTS=(claude agy copilot codex opencode)
+
+if [[ -t 2 ]]; then bold=$'\e[1m'; red=$'\e[31m'; green=$'\e[32m'; yellow=$'\e[33m'; reset=$'\e[0m'; else bold=""; red=""; green=""; yellow=""; reset=""; fi
+info() { printf '%s\n' "$*" >&2; }
+ok() { printf '%s✓%s %s\n' "${green}" "${reset}" "$*" >&2; }
+warn() { printf '%s!%s %s\n' "${yellow}" "${reset}" "$*" >&2; }
+die() { printf '%serror:%s %s\n' "${red}" "${reset}" "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+${bold}agentic-devbox${reset}: isolated multi-agent sidecar for any Docker Compose project
+
+${bold}Project commands${reset} (run inside a project whose compose file includes base-compose.yml)
+  init [--app <service>]   Prepare this project: .agentic-devbox/ folders, .gitignore entries,
+                           and the compose lines to add
+  up                       Start the stack and wait until it is healthy
+  down                     Stop the stack (state in .agentic-devbox/home is kept)
+  shell                    Open a bash shell in the sidecar
+  claude | agy | copilot | codex | opencode [args...]
+                           Run that agent in the sidecar
+  code [folder]            Open desktop VS Code attached to the sidecar (default folder: /workspace)
+  vscode-web [--open]      Print (or open) the URL of VS Code in the browser
+  browser <args...>        Run devbox-browser (status, open, screenshot, console, run)
+  run <command...>         Run any command in the sidecar
+  config [agent]           Show merged MCP servers and what each agent receives
+  apply                    Re-apply MCP and settings layers without restarting
+  doctor                   Check host prerequisites and the running sidecar
+  logs                     Follow the sidecar's logs
+
+${bold}Global commands${reset}
+  build                    Build the shared image (${IMAGE})
+  update                   Pull the latest agentic-devbox and rebuild with fresh agent CLIs
+  version                  Print the installed version
+
+Sandbox home: ${AGENTIC_DEVBOX_HOME}
+EOF
+}
+
+compose() { docker compose "$@"; }
+
+# Linux needs the image user to match your uid so /workspace files keep your ownership.
+export_ids() {
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    export AGENT_UID="${AGENT_UID:-$(id -u)}" AGENT_GID="${AGENT_GID:-$(id -g)}"
+  fi
+}
+
+# Value of KEY from ./.env without sourcing it.
+dotenv_value() {
+  [[ -f .env ]] || return 0
+  sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" .env | tail -n1 | sed -e 's/^["'\'']//' -e 's/["'\'']$//'
+}
+
+# Appends a line to a file, adding the missing final newline first if needed.
+append_line() {
+  local file="$1" line="$2"
+  if [[ -s "${file}" && -n "$(tail -c1 "${file}")" ]]; then printf '\n' >>"${file}"; fi
+  printf '%s\n' "${line}" >>"${file}"
+}
+
+# Create bind-mount sources with your ownership before Docker creates them as root.
+prepare_dirs() {
+  local state
+  state="$(dotenv_value AGENTIC_DEVBOX_STATE_DIR)"
+  state="${state:-./.agentic-devbox/home}"
+  state="${state/#\$\{HOME\}/${HOME}}"
+  state="${state/#\~/${HOME}}"
+  mkdir -p .agentic-devbox "${state}"
+}
+
+in_sidecar() {
+  local tty=()
+  [[ -t 0 && -t 1 ]] || tty=(-T)
+  compose exec "${tty[@]}" "${SERVICE}" "$@"
+}
+
+require_running() {
+  compose ps --status running --services 2>/dev/null | grep -qx "${SERVICE}" \
+    || die "the ${SERVICE} service is not running here. Start it with: agentic-devbox up"
+}
+
+cmd_build() {
+  export_ids
+  info "Building ${IMAGE} from ${AGENTIC_DEVBOX_HOME} ..."
+  # Valueless --build-arg forwards the variable only when it is set; otherwise the
+  # Dockerfile default applies (same behaviour as base-compose.yml).
+  docker build -f "${AGENTIC_DEVBOX_HOME}/Dockerfile.agents" -t "${IMAGE}" \
+    --build-arg AGENT_UID --build-arg AGENT_GID --build-arg AGENTIC_DEVBOX_AGENTS \
+    "$@" "${AGENTIC_DEVBOX_HOME}"
+  ok "built ${IMAGE}"
+}
+
+cmd_update() {
+  if [[ -d "${AGENTIC_DEVBOX_HOME}/.git" ]]; then
+    info "Updating ${AGENTIC_DEVBOX_HOME} ..."
+    git -C "${AGENTIC_DEVBOX_HOME}" pull --rebase --autostash
+  else
+    warn "${AGENTIC_DEVBOX_HOME} is not a git checkout; skipping the source update"
+  fi
+  # A new value re-runs the agent CLI install layer, so `latest` versions are fetched again.
+  cmd_build --build-arg "AGENT_TOOLS_REFRESH=$(date +%Y%m%d%H%M%S)"
+  info "Recreate running sidecars to use the new image: agentic-devbox up (in each project)"
+}
+
+cmd_init() {
+  local app="app"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --app) app="${2:?--app needs a service name}"; shift 2 ;;
+      *) die "unknown option for init: $1" ;;
+    esac
+  done
+  prepare_dirs
+  ok "created .agentic-devbox/ (config layers) and .agentic-devbox/home/ (private tool state)"
+
+  local entry
+  for entry in ".agentic-devbox/home/" ".agentic-devbox/secrets.env"; do
+    if ! grep -qxF "${entry}" .gitignore 2>/dev/null; then
+      append_line .gitignore "${entry}"
+      ok "added ${entry} to .gitignore"
+    fi
+  done
+  if [[ -f .dockerignore ]] && ! grep -qxF ".agentic-devbox/" .dockerignore; then
+    append_line .dockerignore ".agentic-devbox/"
+    ok "added .agentic-devbox/ to .dockerignore (keeps agent logins out of your app images)"
+  fi
+
+  cat >&2 <<EOF
+
+${bold}Add these lines to your compose file:${reset}
+
+EOF
+  sed -n '/# >>> agentic-devbox include/,/# <<< agentic-devbox include/p' \
+    "${AGENTIC_DEVBOX_HOME}/project-template/docker-compose.yml" | sed '1d;$d'
+  cat <<EOF
+
+services:
+  ${SERVICE}:
+    network_mode: "service:${app}"   # share ${app}'s network: reach it on localhost
+EOF
+  cat >&2 <<EOF
+
+Optional: .agentic-devbox/mcp-project.json and .agentic-devbox/settings-project.json
+(see ${AGENTIC_DEVBOX_HOME}/project-template/.agentic-devbox for examples).
+Then run: agentic-devbox up
+EOF
+}
+
+cmd_up() {
+  export_ids
+  prepare_dirs
+  if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then cmd_build; fi
+  compose up -d --wait "$@"
+  ok "sidecar ready. Try: agentic-devbox claude   |   agentic-devbox browser status"
+}
+
+sidecar_id() {
+  compose ps -q "${SERVICE}" 2>/dev/null | head -n1
+}
+
+# Desktop VS Code, attached to the running sidecar (needs the Dev Containers extension).
+vscode_bin() {
+  local candidate
+  for candidate in "$(command -v code 2>/dev/null)" \
+    "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code" \
+    "${HOME}/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"; do
+    if [[ -n "${candidate}" && -x "${candidate}" ]]; then printf '%s\n' "${candidate}"; return 0; fi
+  done
+  return 1
+}
+
+cmd_code() {
+  require_running
+  local folder="${1:-}" code_bin name hex
+  code_bin="$(vscode_bin)" || die "VS Code not found. Install it, or run 'Shell Command: Install code command in PATH' in VS Code"
+  [[ -n "${folder}" ]] || folder="$(in_sidecar printenv AGENTIC_DEVBOX_VSCODE_FOLDER 2>/dev/null | tr -d '\r' || true)"
+  folder="${folder:-/workspace}"
+  # Same authority VS Code records for "Attach to Running Container": hex-encoded JSON
+  # with the container name, so the link keeps working after the container is recreated.
+  name="$(docker inspect --format '{{.Name}}' "$(sidecar_id)")"
+  hex="$(printf '{"containerName":"%s"}' "${name}" | od -An -tx1 | tr -d ' \n')"
+  info "Opening ${folder} in ${name#/} ..."
+  "${code_bin}" --folder-uri "vscode-remote://attached-container+${hex}${folder}"
+}
+
+cmd_vscode_web() {
+  require_running
+  local enabled port token url
+  enabled="$(in_sidecar printenv AGENTIC_DEVBOX_VSCODE_WEB 2>/dev/null | tr -d '\r' || true)"
+  [[ "${enabled}" == "1" ]] || die "VS Code in the browser is off. Set AGENTIC_DEVBOX_VSCODE_WEB=1 for the ${SERVICE} service and publish its port (see docs/vscode.md)"
+  port="$(in_sidecar printenv AGENTIC_DEVBOX_VSCODE_WEB_PORT 2>/dev/null | tr -d '\r' || true)"
+  token="$(in_sidecar cat /home/agent/.agentic-devbox/vscode/connection-token 2>/dev/null | tr -d '\r')"
+  [[ -n "${token}" ]] || die "no connection token yet; check the sidecar log: agentic-devbox logs"
+  url="http://localhost:${port:-8800}/?tkn=${token}"
+  printf '%s\n' "${url}"
+  if [[ "${1:-}" == "--open" ]]; then
+    if command -v open >/dev/null; then open "${url}"; elif command -v xdg-open >/dev/null; then xdg-open "${url}"; fi
+  fi
+}
+
+cmd_doctor() {
+  local problems=0 version major
+  command -v docker >/dev/null || die "docker is not installed"
+  ok "docker $(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '(daemon not reachable)')"
+  version="$(docker compose version --short 2>/dev/null || true)"
+  major="${version#v}"; major="${major%%.*}"
+  if [[ -z "${version}" ]]; then warn "docker compose plugin not found"; problems=$((problems + 1))
+  elif [[ "${major}" -lt 5 ]]; then warn "docker compose ${version}: v5+ is required to override included services in one file (see README, 'Older Compose')"; problems=$((problems + 1))
+  else ok "docker compose ${version}"; fi
+
+  local f
+  for f in base-compose.yml Dockerfile.agents mcp-global.json settings-global.json env/passthrough.env; do
+    if [[ -f "${AGENTIC_DEVBOX_HOME}/${f}" ]]; then ok "${AGENTIC_DEVBOX_HOME}/${f}"; else warn "missing ${AGENTIC_DEVBOX_HOME}/${f}"; problems=$((problems + 1)); fi
+  done
+  if [[ -f "${AGENTIC_DEVBOX_HOME}/secrets.env" ]]; then
+    local mode
+    mode="$(stat -c '%a' "${AGENTIC_DEVBOX_HOME}/secrets.env" 2>/dev/null || stat -f '%Lp' "${AGENTIC_DEVBOX_HOME}/secrets.env")"
+    if [[ "${mode}" == "600" ]]; then ok "secrets.env is private (600)"
+    else warn "secrets.env has mode ${mode}; run: chmod 600 ${AGENTIC_DEVBOX_HOME}/secrets.env"; fi
+  fi
+  if docker image inspect "${IMAGE}" >/dev/null 2>&1; then ok "image ${IMAGE} present"; else warn "image ${IMAGE} not built yet (agentic-devbox build)"; fi
+  if [[ "$(uname -s)" == "Linux" && "$(id -u)" != "1000" && -z "${AGENT_UID:-}" ]]; then
+    info "  note: your uid is $(id -u); the CLI builds the image with it. With plain compose, export AGENT_UID/AGENT_GID."
+  fi
+
+  if compose ps --status running --services 2>/dev/null | grep -qx "${SERVICE}"; then
+    info ""
+    in_sidecar agentic-devbox-config doctor || problems=$((problems + 1))
+  else
+    info "  (no running ${SERVICE} in this folder; start it with: agentic-devbox up)"
+  fi
+  return $((problems > 0))
+}
+
+main() {
+  local command="${1:-help}"
+  [[ $# -gt 0 ]] && shift
+  case "${command}" in
+    help | -h | --help) usage ;;
+    version | --version) git -C "${AGENTIC_DEVBOX_HOME}" describe --tags --always 2>/dev/null || echo "unknown (not a git checkout)" ;;
+    build) cmd_build "$@" ;;
+    update) cmd_update ;;
+    init) cmd_init "$@" ;;
+    up) cmd_up "$@" ;;
+    down) compose down "$@" ;;
+    logs) compose logs -f "${SERVICE}" ;;
+    doctor) cmd_doctor ;;
+    shell) require_running; in_sidecar bash -l ;;
+    code) cmd_code "$@" ;;
+    vscode-web) cmd_vscode_web "$@" ;;
+    browser) require_running; in_sidecar devbox-browser "$@" ;;
+    config) require_running; in_sidecar agentic-devbox-config show "$@" ;;
+    apply) require_running; in_sidecar agentic-devbox-config apply ;;
+    run) require_running; in_sidecar "$@" ;;
+    *)
+      if [[ " ${AGENTS[*]} " == *" ${command} "* ]]; then require_running; in_sidecar "${command}" "$@"
+      else usage >&2; die "unknown command: ${command}"; fi
+      ;;
+  esac
+}
+
+main "$@"

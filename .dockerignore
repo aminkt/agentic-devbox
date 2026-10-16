@@ -1,0 +1,8 @@
+# Allowlist: only what Dockerfile.agents needs. Keeps secrets.env, .git and
+# project files out of the build context.
+*
+!Dockerfile.agents
+!mcp-global.json
+!runtime/
+runtime/node_modules
+runtime/test

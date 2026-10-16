@@ -1,0 +1,61 @@
+# agentic-devbox · optional exec bridge: `docker exec` from the sidecar into the other
+# containers of the same Compose project, without giving the sidecar the Docker socket.
+#
+# Add it as a second file of the same include entry, after base-compose.yml:
+#
+#   include:
+#     - path:
+#         - ${AGENTIC_DEVBOX_HOME:-${HOME}/.config/agentic-devbox}/base-compose.yml
+#         - ${AGENTIC_DEVBOX_HOME:-${HOME}/.config/agentic-devbox}/exec-bridge.yml
+#       project_directory: .
+#
+# Inside the sidecar, `docker exec`, `docker compose exec`, `docker-compose exec` and
+# `docker ps` then work for this project's containers, and nothing else does.
+#
+# The bridge holds the Docker socket, which is root-equivalent on the host. It runs in
+# its own locked-down container with no network, and only the sidecar shares the
+# volume that holds its socket. See docs/exec-bridge.md before enabling it.
+#
+# Knobs, read from the project's .env file:
+#   AGENTIC_DEVBOX_BRIDGE_USERS         non-root (default) or any (same as `docker exec` on the host)
+#   AGENTIC_DEVBOX_BRIDGE_DEFAULT_USER  user for requests without -u
+#   AGENTIC_DEVBOX_BRIDGE_DENY_USERS    extra users to refuse in non-root mode (e.g. sudo-capable ones)
+
+services:
+  agent-exec-bridge:
+    image: agentic-devbox:local
+    entrypoint: ["/usr/bin/tini", "--"]
+    command: ["agentic-devbox-exec-bridge", "serve"]
+    # Root inside this container only, to open the Docker socket; no capabilities, no network.
+    user: "0:0"
+    environment:
+      - AGENTIC_DEVBOX_BRIDGE_USERS
+      - AGENTIC_DEVBOX_BRIDGE_DEFAULT_USER
+      - AGENTIC_DEVBOX_BRIDGE_DENY_USERS
+    volumes:
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+      - agent-exec-bridge:/run/agent-exec-bridge
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "test", "-S", "/run/agent-exec-bridge/bridge.sock"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  universal-agent:
+    depends_on:
+      agent-exec-bridge:
+        condition: service_healthy
+    volumes:
+      - agent-exec-bridge:/run/agent-exec-bridge:ro
+
+volumes:
+  agent-exec-bridge: {}
