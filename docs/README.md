@@ -11,6 +11,7 @@ Start with **getting started**, then read the page for the task in front of you.
 | [VS Code](vscode.md) | Use desktop VS Code or VS Code in the browser inside the sandbox |
 | [Exec bridge](exec-bridge.md) | Let agents run `docker exec` into your other containers |
 | [Shared app environments](shared-app-environments.md) | Serve several projects from one app container with one sidecar |
+| [Multi-service and multi-repo environments](workplaces.md) | Use one sidecar across several repositories and services behind a reverse proxy, with a script around Compose |
 | [Security](security.md) | Know what the sandbox protects and how to tighten it |
 | [Commands](cli.md) | Look up a command |
 | [Troubleshooting](troubleshooting.md) | Fix a problem |

@@ -13,6 +13,8 @@ docker ps [--format TEMPLATE] [-q] [-a]
 
 Everything else (`docker run`, `docker build`, `docker compose up`, other projects' containers) is refused.
 
+Global Compose flags such as `-f`, `-p` and `--project-directory` are accepted and ignored, because the bridge always targets its own project. Scripts that wrap Compose therefore work unchanged: `./dev.sh exec api npm test`, which runs `docker compose -f stacks/docker-compose.yml exec api npm test`, works in the sidecar, while the script's `up` or `logs` commands are refused.
+
 ## Enable it
 
 List `exec-bridge.yml` as a second file of the same include entry:

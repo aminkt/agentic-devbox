@@ -23,15 +23,19 @@ usage() {
   cat <<EOF
 ${bold}agentic-devbox${reset}: isolated multi-agent sidecar for any Docker Compose project
 
-${bold}Project commands${reset} (run inside a project whose compose file includes base-compose.yml)
-  init [--app <service>]   Prepare this project: .agentic-devbox/ folders, .gitignore entries,
-                           and the compose lines to add
+${bold}Project commands${reset} (run anywhere in a project whose compose file includes base-compose.yml;
+the project root is the nearest folder above with .agentic-devbox/)
+  init [--app <service> | --network <name>...]
+                           Prepare this project: .agentic-devbox/ folders, .gitignore entries,
+                           and the compose lines to add. --app shares that service's network
+                           (default: app); --network joins those networks as a container of its own
   up                       Start the stack and wait until it is healthy
   down                     Stop the stack (state in .agentic-devbox/home is kept)
   shell                    Open a bash shell in the sidecar
   claude | agy | copilot | codex | opencode [args...]
-                           Run that agent in the sidecar
-  code [folder]            Open desktop VS Code attached to the sidecar (default folder: /workspace)
+                           Run that agent in the sidecar, in the folder matching your current one
+  code [folder]            Open desktop VS Code attached to the sidecar (default: the folder
+                           matching your current one, else AGENTIC_DEVBOX_VSCODE_FOLDER or /workspace)
   vscode-web [--open]      Print (or open) the URL of VS Code in the browser
   browser <args...>        Run devbox-browser (status, open, screenshot, console, run)
   run <command...>         Run any command in the sidecar
@@ -49,7 +53,33 @@ Sandbox home: ${AGENTIC_DEVBOX_HOME}
 EOF
 }
 
-compose() { docker compose "$@"; }
+# Where the command was started, before enter_project moves to the project root.
+start_dir="${PWD}"
+start_dir_physical="$(pwd -P)"
+# Sidecar folder for exec (see sidecar_cwd); set by require_running.
+exec_dir=""
+
+# How this project runs Compose; enter_project replaces it with AGENTIC_DEVBOX_COMPOSE when set.
+compose_cmd=(docker compose)
+compose() { "${compose_cmd[@]}" "$@"; }
+
+# Project commands run from the project root: the nearest folder at or above this one that holds
+# .agentic-devbox/, stopping below your home folder (~/.agentic-devbox is shared state, not a
+# project). Without one, the current folder. Projects that wrap Compose in a script (to set
+# variables or pick generated files) name that command in AGENTIC_DEVBOX_COMPOSE, in the shell
+# or the project's .env, e.g. AGENTIC_DEVBOX_COMPOSE=./dev.sh compose.
+enter_project() {
+  local dir="${PWD}" custom
+  while [[ "${dir}" != "/" && "${dir}" != "${HOME}" ]]; do
+    if [[ -d "${dir}/.agentic-devbox" ]]; then
+      cd "${dir}" || die "cannot enter the project root ${dir}"
+      break
+    fi
+    dir="$(dirname "${dir}")"
+  done
+  custom="${AGENTIC_DEVBOX_COMPOSE:-$(dotenv_value AGENTIC_DEVBOX_COMPOSE)}"
+  if [[ -n "${custom}" ]]; then read -r -a compose_cmd <<<"${custom}"; fi
+}
 
 # Linux needs the image user to match your uid so /workspace files keep your ownership.
 export_ids() {
@@ -82,14 +112,36 @@ prepare_dirs() {
 }
 
 in_sidecar() {
-  local tty=()
-  [[ -t 0 && -t 1 ]] || tty=(-T)
-  compose exec "${tty[@]}" "${SERVICE}" "$@"
+  local opts=()
+  [[ -t 0 && -t 1 ]] || opts+=(-T)
+  [[ -z "${exec_dir}" ]] || opts+=(-w "${exec_dir}")
+  # Guarded expansion: an empty array is "unbound" under set -u in bash 3.2 (macOS).
+  compose exec ${opts[@]+"${opts[@]}"} "${SERVICE}" "$@"
 }
 
 require_running() {
   compose ps --status running --services 2>/dev/null | grep -qx "${SERVICE}" \
     || die "the ${SERVICE} service is not running here. Start it with: agentic-devbox up"
+  exec_dir="$(sidecar_cwd)"
+}
+
+# The sidecar folder that matches the folder you ran the command in: the bind mount at the
+# sidecar's working directory (the project, /workspace by default) plus your path below it.
+# Empty at the top of that mount or outside it, so commands start in the working directory.
+# This lets you start an agent in one repository of a multi-repo project with its own instructions.
+sidecar_cwd() {
+  local id wd src here
+  id="$(sidecar_id)"
+  [[ -n "${id}" ]] || return 0
+  wd="$(docker inspect --format '{{.Config.WorkingDir}}' "${id}")"
+  src="$(docker inspect --format "{{range .Mounts}}{{if eq .Destination \"${wd}\"}}{{.Source}}{{end}}{{end}}" "${id}")"
+  [[ -n "${src}" ]] || return 0
+  for here in "${start_dir}" "${start_dir_physical}"; do
+    if [[ "${here}" == "${src}"/* ]]; then
+      printf '%s%s\n' "${wd}" "${here#"${src}"}"
+      return 0
+    fi
+  done
 }
 
 cmd_build() {
@@ -116,13 +168,18 @@ cmd_update() {
 }
 
 cmd_init() {
-  local app="app"
+  local app="" networks=() list
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --app) app="${2:?--app needs a service name}"; shift 2 ;;
+      --network) networks+=("${2:?--network needs a network name}"); shift 2 ;;
       *) die "unknown option for init: $1" ;;
     esac
   done
+  if [[ -n "${app}" && ${#networks[@]} -gt 0 ]]; then
+    die "use --app or --network, not both: the sidecar either shares one service's network or joins networks as its own container"
+  fi
+  [[ -n "${app}" || ${#networks[@]} -gt 0 ]] || app="app"
   prepare_dirs
   ok "created .agentic-devbox/ (config layers) and .agentic-devbox/home/ (private tool state)"
 
@@ -145,12 +202,22 @@ ${bold}Add these lines to your compose file:${reset}
 EOF
   sed -n '/# >>> agentic-devbox include/,/# <<< agentic-devbox include/p' \
     "${AGENTIC_DEVBOX_HOME}/project-template/docker-compose.yml" | sed '1d;$d'
-  cat <<EOF
+  if [[ -n "${app}" ]]; then
+    cat <<EOF
 
 services:
   ${SERVICE}:
     network_mode: "service:${app}"   # share ${app}'s network: reach it on localhost
 EOF
+  else
+    list="$(printf ', %s' "${networks[@]}")"
+    cat <<EOF
+
+services:
+  ${SERVICE}:
+    networks: [${list:2}]   # own container on these networks: reach services by name and alias
+EOF
+  fi
   cat >&2 <<EOF
 
 Optional: .agentic-devbox/mcp-project.json and .agentic-devbox/settings-project.json
@@ -186,6 +253,7 @@ cmd_code() {
   require_running
   local folder="${1:-}" code_bin name hex
   code_bin="$(vscode_bin)" || die "VS Code not found. Install it, or run 'Shell Command: Install code command in PATH' in VS Code"
+  [[ -n "${folder}" ]] || folder="${exec_dir}"
   [[ -n "${folder}" ]] || folder="$(in_sidecar printenv AGENTIC_DEVBOX_VSCODE_FOLDER 2>/dev/null | tr -d '\r' || true)"
   folder="${folder:-/workspace}"
   # Same authority VS Code records for "Attach to Running Container": hex-encoded JSON
@@ -232,6 +300,7 @@ cmd_doctor() {
     else warn "secrets.env has mode ${mode}; run: chmod 600 ${AGENTIC_DEVBOX_HOME}/secrets.env"; fi
   fi
   if docker image inspect "${IMAGE}" >/dev/null 2>&1; then ok "image ${IMAGE} present"; else warn "image ${IMAGE} not built yet (agentic-devbox build)"; fi
+  info "  project: ${PWD} (compose command: ${compose_cmd[*]})"
   if [[ "$(uname -s)" == "Linux" && "$(id -u)" != "1000" && -z "${AGENT_UID:-}" ]]; then
     info "  note: your uid is $(id -u); the CLI builds the image with it. With plain compose, export AGENT_UID/AGENT_GID."
   fi
@@ -248,6 +317,10 @@ cmd_doctor() {
 main() {
   local command="${1:-help}"
   [[ $# -gt 0 ]] && shift
+  case "${command}" in
+    help | -h | --help | version | --version | build | update | init) ;;
+    *) enter_project ;;
+  esac
   case "${command}" in
     help | -h | --help) usage ;;
     version | --version) git -C "${AGENTIC_DEVBOX_HOME}" describe --tags --always 2>/dev/null || echo "unknown (not a git checkout)" ;;

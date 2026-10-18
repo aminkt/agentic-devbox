@@ -92,11 +92,14 @@ services:
     network_mode: "service:web"
 ```
 
+`network_mode: "service:web"` puts the agent in `web`'s network namespace, so `localhost` in the agent is your app. When there is no single app to attach to, for example several services behind a reverse proxy, run `agentic-devbox init --network default` instead: the sidecar becomes its own container on the project's network and reaches services by name and network alias. [architecture.md](architecture.md#the-network-model) compares the two.
+
 Then run `agentic-devbox up`. Next steps:
 
 - Add project MCP servers and agent settings: [configuration.md](configuration.md).
 - Let agents run commands in your other containers: [exec-bridge.md](exec-bridge.md).
 - Several projects served by one app container: [shared-app-environments.md](shared-app-environments.md).
+- Several services and repositories, a reverse proxy, or a script around Compose: [workplaces.md](workplaces.md).
 - Before running agents unattended: [security.md](security.md).
 
 ## Update and uninstall

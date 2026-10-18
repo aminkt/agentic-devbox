@@ -98,6 +98,8 @@ services:
       # AGENTIC_DEVBOX_VSCODE_WEB_PORT: "8800"   # change if 8800 is taken
 ```
 
+When the sidecar joins the project's networks instead of sharing a service's ([architecture.md](architecture.md#the-network-model)), publish the port on `universal-agent` itself.
+
 Setting `AGENTIC_DEVBOX_VSCODE_WEB=1` accepts the [VS Code Server license terms](https://aka.ms/vscode-server-license) on your behalf.
 
 ### Open it

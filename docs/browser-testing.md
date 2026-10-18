@@ -2,7 +2,7 @@
 
 Every sidecar runs its own headless Google Chrome, separate from any browser on your machine. Agents drive it three ways, all against the same browser at `http://127.0.0.1:9222`: the `/browser` skill, the Chrome DevTools MCP tools, and the `devbox-browser` command.
 
-Because the sidecar shares the app's network namespace, the browser opens your app at `http://localhost:<port>`. Every container start gets a fresh profile in memory, so no cookies or logins carry over between runs.
+When the sidecar shares the app's network namespace, the browser opens your app at `http://localhost:<port>`. When it joins the project's networks instead, use the service name or a hostname the project declares as a network alias, such as `http://web:3000` or `https://api.example.test` ([workplaces.md](workplaces.md#3-hostnames-and-https)). Every container start gets a fresh profile in memory, so no cookies or logins carry over between runs.
 
 ## The `/browser` skill
 
@@ -96,7 +96,7 @@ A local app on HTTPS with a self-signed certificate fails with `ERR_CERT_AUTHORI
 Chrome only listens inside the namespace. To open its DevTools from your machine:
 
 1. Set `AGENTIC_DEVBOX_CDP_EXPOSE: "1"` on `universal-agent`. The sidecar then forwards port 9223 to Chrome.
-2. Publish it on the app service, on loopback only: `- "127.0.0.1:9223:9223"`.
+2. Publish it on loopback only, `- "127.0.0.1:9223:9223"`, on the app service, or on `universal-agent` when the sidecar has its own network namespace.
 3. Restart, then open `http://localhost:9223/json`, or add `localhost:9223` under `chrome://inspect` in your own Chrome.
 
 Anyone who reaches that port controls the sandbox browser, so never publish it on `0.0.0.0`.

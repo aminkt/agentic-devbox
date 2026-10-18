@@ -54,14 +54,28 @@ Three Compose features make this work:
 
 ## The network model
 
-`network_mode: "service:app"` starts the sidecar inside the app container's network namespace. They share one loopback interface and one set of ports:
+The sidecar connects to your project's network in one of two ways. In both, agents reach what your Compose file gives its services and nothing more: the sidecar adds no ports, routes, host entries or DNS rules of its own.
+
+| | Share one service's namespace | Join the project's networks |
+| --- | --- | --- |
+| Override on `universal-agent` | `network_mode: "service:app"` | none (the `default` network), or `networks: [...]` |
+| `agentic-devbox init` | `--app app` (the default) | `--network default` |
+| `localhost` in the sidecar | the app | the sidecar itself |
+| Other services | by name, through the app's networks and `/etc/hosts` | by name and network alias, on the networks it joins |
+| Extra ports (VS Code in the browser, DevTools) | published on the app service | published on the sidecar |
+| When the app container is recreated | the sidecar restarts with it | unaffected |
+| Fits | one app that agents test at `localhost` | several services behind a reverse proxy, multi-repo environments ([workplaces.md](workplaces.md)) |
+
+**Sharing a namespace.** `network_mode: "service:app"` starts the sidecar inside the app container's network namespace. They share one loopback interface, one set of ports and the app's `/etc/hosts`:
 
 - `localhost:<port>` inside the sidecar is the app.
 - Other services are reachable by name through the app's networks, exactly as the app reaches them.
 - A port the app publishes on the host is the only way in from outside. The sidecar cannot publish ports of its own (Docker rejects `ports:` on a service with `network_mode: service:...`), so you publish extra ports, such as VS Code in the browser, on the app service.
 - If the app container is recreated, Compose restarts the sidecar with it (`depends_on` with `restart: true` is added automatically).
 
-Chrome binds `127.0.0.1:9222` inside this namespace. Nothing outside the namespace can reach it unless you forward it on purpose.
+**Joining the networks.** Without `network_mode`, the sidecar is one more container of the project, on the `default` network like any service without a `networks:` key. List other networks to join them as well. Docker's DNS resolves the service names and the network aliases the project declares on those networks, so a hostname such as `api.example.test` works in the sidecar when a reverse proxy service carries it as an alias, and fails when nothing declares it. The sidecar can publish its own ports.
+
+Chrome binds `127.0.0.1:9222` inside the sidecar's namespace (the app's, when shared). Nothing outside that namespace can reach it unless you forward it on purpose.
 
 ## Mounts
 
@@ -142,7 +156,7 @@ Details and policies: [exec-bridge.md](exec-bridge.md).
 | Decision | Why |
 | --- | --- |
 | A sidecar next to the app, not a devcontainer replacing it | Your app keeps its own image and Compose setup; the sandbox adds one service and changes nothing else |
-| Shared network namespace | The agent tests the app at `localhost` exactly as you would, with no port plumbing |
+| The project's own network, in one of two modes | Agents reach exactly what your Compose file offers its services. Sharing the app's namespace adds `localhost` with no port plumbing; joining the networks suits environments with many services behind a proxy |
 | One image per machine, state per project | Builds once, then every project starts fast while logins and history stay separate |
 | Layers mounted read-only | An agent cannot add MCP servers to itself or relax its own permissions |
 | Native files written by a 3-way merge | Each agent keeps working with its own UI and commands (`claude mcp list`, `/config`), and your layers still win |

@@ -242,6 +242,7 @@ To reset one agent in one project, stop the sidecar and delete its folder, for e
 | Variable | Where | Default | Effect |
 | --- | --- | --- | --- |
 | `AGENTIC_DEVBOX_HOME` | shell | `~/.config/agentic-devbox` | Location of the installation |
+| `AGENTIC_DEVBOX_COMPOSE` | shell or project `.env` | `docker compose` | Command the CLI runs Compose with, for projects that wrap it in a script ([workplaces.md](workplaces.md#5-a-script-around-compose)) |
 | `AGENTIC_DEVBOX_STATE_DIR` | project `.env` | `./.agentic-devbox/home` | Host folder for agent state |
 | `AGENTIC_DEVBOX_MEMORY` | project `.env` | `8g` | Sidecar memory limit |
 | `AGENTIC_DEVBOX_BROWSER` | compose or secrets | `1` | `0` disables headless Chrome |

@@ -34,6 +34,7 @@ What you get:
 | [VS Code](docs/vscode.md) | Desktop VS Code via Dev Containers, VS Code in the browser |
 | [Exec bridge](docs/exec-bridge.md) | `docker exec` / `docker compose exec` from the sandbox |
 | [Shared app environments](docs/shared-app-environments.md) | One sidecar for several projects served by one app container |
+| [Multi-repo environments](docs/workplaces.md) | One sidecar for several repositories and services behind a reverse proxy |
 | [Security](docs/security.md) | What is protected, credentials, egress, MCP servers, databases |
 | [Commands](docs/cli.md) · [Troubleshooting](docs/troubleshooting.md) | Reference |
 
@@ -57,7 +58,7 @@ flowchart LR
 ```
 
 - **Sidecar pattern.** Your project keeps its own compose file and adds an `include:` of the shared blueprint plus one line that attaches the agent to your app. The blueprint stays in one place, so `agentic-devbox update` reaches every project, and nothing is copied into your repository.
-- **Shared network.** `network_mode: "service:app"` puts the agent inside the app's network namespace: same `localhost`, same service names, no port mapping.
+- **Shared network.** `network_mode: "service:app"` puts the agent inside the app's network namespace: same `localhost`, same service names, no port mapping. For environments with many services behind a proxy, the sidecar can instead join the project's networks as its own container and reach services by name and alias ([architecture](docs/architecture.md#the-network-model)).
 - **Isolated testing browser.** Chrome runs headless inside the sidecar with a fresh in-memory profile at every start, reachable only from inside the namespace unless you forward it.
 - **Dual-layer configuration.** Global and project files in the standard `mcpServers` format are merged and written into each agent's native file (`.claude.json`, `mcp-config.json`, `mcp_config.json`, `config.toml`, `opencode.json`) by a three-way merge that keeps what the agents write themselves.
 
